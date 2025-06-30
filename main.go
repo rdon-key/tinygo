@@ -138,8 +138,9 @@ func printCommand(cmd string, args ...string) {
 }
 
 // Build compiles and links the given package and writes it to outpath.
-func Build(pkgName, outpath string, config *compileopts.Config) error {
+func Build(pkgName string, config *compileopts.Config) error {
 	// Create a temporary directory for intermediary files.
+	outpath := config.Options.Outpath
 	tmpdir, err := os.MkdirTemp("", "tinygo")
 	if err != nil {
 		return err
@@ -1773,7 +1774,8 @@ func main() {
 
 		config, err := builder.NewConfig(options)
 		handleCompilerError(err)
-		err = Build(pkgName, outpath, config)
+		config.Options.Outpath = outpath
+		err = Build(pkgName, config)
 		printBuildOutput(err, *flagJSON)
 	case "flash", "gdb", "lldb":
 		pkgName := filepath.ToSlash(flag.Arg(0))

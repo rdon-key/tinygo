@@ -59,6 +59,7 @@ type Options struct {
 	WITPackage      string // pass through to wasm-tools component embed invocation
 	WITWorld        string // pass through to wasm-tools component embed -w option
 	ExtLDFlags      []string
+	Outpath         string // output file path for -o flag
 }
 
 // Verify performs a validation on the given options, raising an error if options are not valid.
