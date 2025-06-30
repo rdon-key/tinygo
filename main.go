@@ -136,68 +136,53 @@ func printCommand(cmd string, args ...string) {
 	}
 	fmt.Fprintln(os.Stderr, strings.Join(command, " "))
 }
-
-// Build compiles and links the given package and writes it to outpath.
-func Build(pkgName string, config *compileopts.Config) error {
-	// Create a temporary directory for intermediary files.
+// Build compiles and links the given package and writes it to Outpath if specified.
+func Build(pkgName string, config *compileopts.Config) (builder.BuildResult, error) {
 	outpath := config.Options.Outpath
+
+	// Create a temporary directory for intermediary files.
 	tmpdir, err := os.MkdirTemp("", "tinygo")
 	if err != nil {
-		return err
+		return builder.BuildResult{}, err
 	}
 	if !config.Options.Work {
 		defer os.RemoveAll(tmpdir)
 	}
 
-	// Do the build.
+	// Call internal builder
 	result, err := builder.Build(pkgName, outpath, tmpdir, config)
 	if err != nil {
-		return err
+		return result, err
 	}
 
-	if result.Binary != "" {
-		// If result.Binary is set, it means there is a build output (elf, hex,
-		// etc) that we need to move to the outpath. If it isn't set, it means
-		// the build output was a .ll, .bc or .o file that has already been
-		// written to outpath and so we don't need to do anything.
-
-		if outpath == "" {
-			if strings.HasSuffix(pkgName, ".go") {
-				// A Go file was specified directly on the command line.
-				// Base the binary name off of it.
-				outpath = filepath.Base(pkgName[:len(pkgName)-3]) + config.DefaultBinaryExtension()
-			} else {
-				// Pick a default output path based on the main directory.
-				outpath = filepath.Base(result.MainDir) + config.DefaultBinaryExtension()
-			}
-		}
-
+	// Save the binary if an output path was specified
+	if result.Binary != "" && outpath != "" {
 		if err := os.Rename(result.Binary, outpath); err != nil {
-			// Moving failed. Do a file copy.
+			// fallback: copy
 			inf, err := os.Open(result.Binary)
 			if err != nil {
-				return err
+				return result, err
 			}
 			defer inf.Close()
+
 			outf, err := os.OpenFile(outpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
 			if err != nil {
-				return err
+				return result, err
 			}
+			defer outf.Close()
 
-			// Copy data to output file.
 			_, err = io.Copy(outf, inf)
 			if err != nil {
-				return err
+				return result, err
 			}
-
-			// Check whether file writing was successful.
-			return outf.Close()
 		}
+		result.Binary = outpath 
 	}
 
-	// Move was successful.
-	return nil
+	return result, nil
 }
+
+
 
 // Test runs the tests in the given package. Returns whether the test passed and
 // possibly an error if the test failed to run.
@@ -340,16 +325,15 @@ func dirsToModuleRootAbs(maindir, modroot string) []string {
 	return dirs
 }
 
-// Flash builds and flashes the built binary to the given serial port.
+
+// Flash builds and flashes the binary to the specified port.
 func Flash(pkgName, port string, options *compileopts.Options) error {
 	config, err := builder.NewConfig(options)
 	if err != nil {
 		return err
 	}
 
-	// determine the type of file to compile
 	var fileExt string
-
 	flashMethod, _ := config.Programmer()
 	switch flashMethod {
 	case "command", "":
@@ -365,163 +349,77 @@ func Flash(pkgName, port string, options *compileopts.Options) error {
 		case strings.Contains(config.Target.FlashCommand, "{zip}"):
 			fileExt = ".zip"
 		default:
-			return errors.New("invalid target file - did you forget the {hex} token in the 'flash-command' section?")
+			return errors.New("invalid flash command format")
 		}
 	case "msd":
-		if config.Target.FlashFilename == "" {
-			return errors.New("invalid target file: flash-method was set to \"msd\" but no msd-firmware-name was set")
-		}
 		fileExt = filepath.Ext(config.Target.FlashFilename)
 	case "openocd":
 		fileExt = ".hex"
 	case "bmp":
 		fileExt = ".elf"
-	case "native":
-		return errors.New("unknown flash method \"native\" - did you miss a -target flag?")
 	default:
-		return errors.New("unknown flash method: " + flashMethod)
+		return fmt.Errorf("unsupported flash method: %s", flashMethod)
 	}
 
-	// Check output file extension compatibility if specified
+	// Check output extension
 	if options.Outpath != "" {
-		expectedExt := fileExt
-		actualExt := filepath.Ext(options.Outpath)
-		if actualExt != expectedExt {
-			return fmt.Errorf("output file extension %s does not match target format %s", actualExt, expectedExt)
-		}
-	}
-	// Create a temporary directory for intermediary files.
-	tmpdir, err := os.MkdirTemp("", "tinygo")
-	if err != nil {
-		return err
-	}
-	if !options.Work {
-		defer os.RemoveAll(tmpdir)
-	}
-
-	// Build the binary.
-	result, err := builder.Build(pkgName, fileExt, tmpdir, config)
-	if err != nil {
-		return err
-	}
-	// Save output file if specified
-	if options.Outpath != "" {
-		err = copyFile(result.Binary, options.Outpath)
-		if err != nil {
-			return &commandError{"failed to save output file", options.Outpath, err}
+		if filepath.Ext(options.Outpath) != fileExt {
+			return fmt.Errorf("output file extension %s does not match expected %s", filepath.Ext(options.Outpath), fileExt)
 		}
 	}
 
-	// do we need port reset to put MCU into bootloader mode?
+	result, err := Build(pkgName, config)
+	if err != nil {
+		return err
+	}
+
+	// Reset port if needed
 	if config.Target.PortReset == "true" && flashMethod != "openocd" {
-		port, err := getDefaultPort(port, config.Target.SerialPort)
+		port, err = getDefaultPort(port, config.Target.SerialPort)
 		if err == nil {
-			err = touchSerialPortAt1200bps(port)
-			if err != nil {
-				return &commandError{"failed to reset port", port, err}
+			if err := touchSerialPortAt1200bps(port); err != nil {
+				return fmt.Errorf("port reset failed: %w", err)
 			}
-			// give the target MCU a chance to restart into bootloader
 			time.Sleep(3 * time.Second)
 		}
 	}
 
-	// Flash the binary to the MCU.
-	switch flashMethod {
-	case "", "command":
-		// Create the command.
+	// Flash via command method
+	if flashMethod == "" || flashMethod == "command" {
 		flashCmd := config.Target.FlashCommand
-		flashCmdList, err := shlex.Split(flashCmd)
+		cmdArgs, err := shlex.Split(flashCmd)
 		if err != nil {
-			return fmt.Errorf("could not parse flash command %#v: %w", flashCmd, err)
+			return err
 		}
-
 		if strings.Contains(flashCmd, "{port}") {
-			var err error
 			port, err = getDefaultPort(port, config.Target.SerialPort)
 			if err != nil {
 				return err
 			}
 		}
-
-		// Fill in fields in the command template.
-		fileToken := "{" + fileExt[1:] + "}"
-		for i, arg := range flashCmdList {
-			arg = strings.ReplaceAll(arg, fileToken, result.Binary)
+		token := "{" + fileExt[1:] + "}"
+		for i, arg := range cmdArgs {
+			arg = strings.ReplaceAll(arg, token, result.Binary)
 			arg = strings.ReplaceAll(arg, "{port}", port)
-			flashCmdList[i] = arg
+			cmdArgs[i] = arg
 		}
-
-		// Execute the command.
-		if len(flashCmdList) < 2 {
-			return fmt.Errorf("invalid flash command: %#v", flashCmd)
-		}
-		cmd := executeCommand(config.Options, flashCmdList[0], flashCmdList[1:]...)
+		cmd := executeCommand(config.Options, cmdArgs[0], cmdArgs[1:]...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Dir = goenv.Get("TINYGOROOT")
-		err = cmd.Run()
-		if err != nil {
-			return &commandError{"failed to flash", result.Binary, err}
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("flash failed: %w", err)
 		}
-	case "msd":
-		// this flashing method copies the binary data to a Mass Storage Device (msd)
-		switch fileExt {
-		case ".uf2":
-			err := flashUF2UsingMSD(config.Target.FlashVolume, result.Binary, config.Options)
-			if err != nil {
-				return &commandError{"failed to flash", result.Binary, err}
-			}
-		case ".hex":
-			err := flashHexUsingMSD(config.Target.FlashVolume, result.Binary, config.Options)
-			if err != nil {
-				return &commandError{"failed to flash", result.Binary, err}
-			}
-		default:
-			return errors.New("mass storage device flashing currently only supports uf2 and hex")
-		}
-	case "openocd":
-		args, err := config.OpenOCDConfiguration()
-		if err != nil {
-			return err
-		}
-		exit := " reset exit"
-		if config.Target.OpenOCDVerify != nil && *config.Target.OpenOCDVerify {
-			exit = " verify" + exit
-		}
-		args = append(args, "-c", "program "+filepath.ToSlash(result.Binary)+exit)
-		cmd := executeCommand(config.Options, "openocd", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			return &commandError{"failed to flash", result.Binary, err}
-		}
-	case "bmp":
-		gdb, err := config.Target.LookupGDB()
-		if err != nil {
-			return err
-		}
-		var bmpGDBPort string
-		bmpGDBPort, _, err = getBMPPorts()
-		if err != nil {
-			return err
-		}
-		args := []string{"-ex", "target extended-remote " + bmpGDBPort, "-ex", "monitor swdp_scan", "-ex", "attach 1", "-ex", "load", filepath.ToSlash(result.Binary)}
-		cmd := executeCommand(config.Options, gdb, args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			return &commandError{"failed to flash", result.Binary, err}
-		}
-	default:
-		return fmt.Errorf("unknown flash method: %s", flashMethod)
 	}
+
 	if options.Monitor {
 		return Monitor(result.Executable, "", config)
 	}
+
 	return nil
 }
+
+
 
 // Debug compiles and flashes a program to a microcontroller (just like Flash)
 // but instead of resetting the target, it will drop into a debug shell like GDB
@@ -1790,7 +1688,8 @@ func main() {
 		config, err := builder.NewConfig(options)
 		handleCompilerError(err)
 		config.Options.Outpath = outpath
-		err = Build(pkgName, config)
+		result, err := Build(pkgName, config)
+		_ = result // unused variable
 		printBuildOutput(err, *flagJSON)
 	case "flash", "gdb", "lldb":
 		pkgName := filepath.ToSlash(flag.Arg(0))
