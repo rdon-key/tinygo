@@ -382,6 +382,14 @@ func Flash(pkgName, port string, options *compileopts.Options) error {
 		return errors.New("unknown flash method: " + flashMethod)
 	}
 
+	// Check output file extension compatibility if specified
+	if options.Outpath != "" {
+		expectedExt := fileExt
+		actualExt := filepath.Ext(options.Outpath)
+		if actualExt != expectedExt {
+			return fmt.Errorf("output file extension %s does not match target format %s", actualExt, expectedExt)
+		}
+	}
 	// Create a temporary directory for intermediary files.
 	tmpdir, err := os.MkdirTemp("", "tinygo")
 	if err != nil {
@@ -398,12 +406,6 @@ func Flash(pkgName, port string, options *compileopts.Options) error {
 	}
 	// Save output file if specified
 	if options.Outpath != "" {
-		// Check file extension compatibility
-		expectedExt := fileExt
-		actualExt := filepath.Ext(options.Outpath)
-		if actualExt != expectedExt {
-			return fmt.Errorf("output file extension %s does not match target format %s", actualExt, expectedExt)
-		}
 		err = copyFile(result.Binary, options.Outpath)
 		if err != nil {
 			return &commandError{"failed to save output file", options.Outpath, err}
@@ -520,8 +522,6 @@ func Flash(pkgName, port string, options *compileopts.Options) error {
 	}
 	return nil
 }
-
-
 
 // Debug compiles and flashes a program to a microcontroller (just like Flash)
 // but instead of resetting the target, it will drop into a debug shell like GDB
