@@ -195,6 +195,40 @@ void ram_func flash_do_cmd(const uint8_t *txbuf, uint8_t *rxbuf, size_t count) {
 	flash_enable_xip_via_boot2();
 }
 
+// --- Added for BOOTSEL Button Support (SDK Style) ---
+#define SIO_BASE 0xd0000000
+#define SIO_GPIO_HI_IN_OFFSET 0x00000008
+
+#define IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS 0x00003000
+#define IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB  12
+
+#define CS_PIN_INDEX 1
+#define GPIO_OVERRIDE_NORMAL 0x0
+#define GPIO_OVERRIDE_LOW    0x2
+
+static inline void hw_write_masked(volatile uint32_t *addr, uint32_t values, uint32_t write_mask) {
+    *addr = (*addr & ~write_mask) | (values & write_mask);
+}
+
+bool ram_func read_bootsel_button() {
+    volatile uint32_t *ctrl_addr = (volatile uint32_t*)(IO_QSPI_BASE + (CS_PIN_INDEX * 8) + 4);
+    uint32_t saved_ctrl = *ctrl_addr;
+
+    hw_write_masked(ctrl_addr,
+                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    for (volatile int i = 0; i < 1000; ++i);
+
+    volatile uint32_t *sio_hw_gpio_hi_in = (volatile uint32_t*)(SIO_BASE + SIO_GPIO_HI_IN_OFFSET);
+    bool button_state = !(*sio_hw_gpio_hi_in & (1u << CS_PIN_INDEX));
+
+    *ctrl_addr = saved_ctrl;
+
+    return button_state;
+}
+// ----------------------------------------
+
 */
 import "C"
 
@@ -251,4 +285,16 @@ func (f flashBlockDevice) eraseBlocks(start, length int64) error {
 	C.flash_erase_blocks(C.uint32_t(address), C.ulong(length*f.EraseBlockSize()))
 
 	return nil
+}
+
+// BootselButton reads the state of the BOOTSEL button on the RP2040.
+// Returns true if the button is currently pressed.
+// Note: This temporarily disables interrupts and XIP cache to safely read the QSPI_SS pin.
+func BootselButton() bool {
+	state := interrupt.Disable()
+	defer interrupt.Restore(state)
+
+	pressed := C.read_bootsel_button()
+
+	return pressed != 0
 }
